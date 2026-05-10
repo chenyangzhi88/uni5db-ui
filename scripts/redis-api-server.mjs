@@ -184,6 +184,17 @@ function toPairs(values) {
   return pairs;
 }
 
+function toStreamEntries(values = []) {
+  return values.map(([id, fields = []]) => ({
+    id,
+    fields: Object.fromEntries(toPairs(fields).map((item) => [item.field, item.value])),
+  }));
+}
+
+function toConsumerGroups(values = []) {
+  return values.map((group) => Object.fromEntries(toPairs(group).map((item) => [item.field, item.value])));
+}
+
 async function describeKey(connection, key) {
   const [type, ttl, memory] = await Promise.all([
     redis(connection, ['TYPE', key]),
@@ -195,6 +206,7 @@ async function describeKey(connection, key) {
   if (type === 'set') length = await redis(connection, ['SCARD', key]);
   if (type === 'zset') length = await redis(connection, ['ZCARD', key]);
   if (type === 'hash') length = await redis(connection, ['HLEN', key]);
+  if (type === 'stream') length = await redis(connection, ['XLEN', key]);
   if (type === 'string') length = await redis(connection, ['STRLEN', key]);
   return { key, type, ttl, memory, length };
 }
@@ -220,12 +232,17 @@ async function listKeys(connection, pattern = '*', type = 'all') {
 async function readKey(connection, key) {
   const info = await describeKey(connection, key);
   let value = null;
+  let consumerGroups = null;
   if (info.type === 'string') value = await redis(connection, ['GET', key]);
   if (info.type === 'list') value = await redis(connection, ['LRANGE', key, '0', String(MAX_ITEMS - 1)]);
   if (info.type === 'set') value = await redis(connection, ['SMEMBERS', key]);
   if (info.type === 'zset') value = toPairs(await redis(connection, ['ZRANGE', key, '0', String(MAX_ITEMS - 1), 'WITHSCORES']));
   if (info.type === 'hash') value = toPairs(await redis(connection, ['HGETALL', key]));
-  return { ...info, value };
+  if (info.type === 'stream') {
+    value = toStreamEntries(await redis(connection, ['XRANGE', key, '-', '+', 'COUNT', String(MAX_ITEMS)]));
+    consumerGroups = toConsumerGroups(await redis(connection, ['XINFO', 'GROUPS', key]).catch(() => []));
+  }
+  return { ...info, value, consumerGroups };
 }
 
 function sendJson(res, statusCode, body) {
@@ -237,6 +254,29 @@ function sendJson(res, statusCode, body) {
     'access-control-allow-headers': 'content-type',
   });
   res.end(json);
+}
+
+function formatError(error) {
+  if (error?.code === 'ECONNREFUSED') {
+    const address = error.address || DEFAULT_HOST;
+    const port = error.port || DEFAULT_PORT;
+    return {
+      statusCode: 503,
+      message: `Connection refused: unable to connect to Redis at ${address}:${port}. Check that redis-server is running and the port is open.`,
+    };
+  }
+  if (error?.code === 'ETIMEDOUT' || error?.code === 'EHOSTUNREACH' || error?.code === 'ENETUNREACH') {
+    const address = error.address || DEFAULT_HOST;
+    const port = error.port || DEFAULT_PORT;
+    return {
+      statusCode: 503,
+      message: `Unable to reach Redis at ${address}:${port} (${error.code}).`,
+    };
+  }
+  return {
+    statusCode: error?.redis ? 400 : 500,
+    message: error?.message || 'Unknown Redis API error',
+  };
 }
 
 function readBody(req) {
@@ -265,8 +305,14 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/redis/ping') {
       const connection = normalizeConnection(Object.fromEntries(url.searchParams));
       const pong = await redis(connection, ['PING']);
-      const info = await redis(connection, ['INFO', 'keyspace']).catch(() => '');
+      const info = await redis(connection, ['INFO']).catch(() => '');
       return sendJson(res, 200, { ok: true, pong, connection: { ...connection, password: Boolean(connection.password) }, info });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/redis/info') {
+      const connection = normalizeConnection(Object.fromEntries(url.searchParams));
+      const info = await redis(connection, ['INFO']);
+      return sendJson(res, 200, { ok: true, info });
     }
 
     if (req.method === 'GET' && url.pathname === '/redis/keys') {
@@ -305,8 +351,9 @@ const server = http.createServer(async (req, res) => {
 
     sendJson(res, 404, { ok: false, error: 'Not found' });
   } catch (error) {
-    pushHistory({ command: req.url, level: 'error', error: error.message });
-    sendJson(res, error.redis ? 400 : 500, { ok: false, error: error.message });
+    const formatted = formatError(error);
+    pushHistory({ command: req.url, level: 'error', error: formatted.message });
+    sendJson(res, formatted.statusCode, { ok: false, error: formatted.message, code: error?.code });
   }
 });
 
